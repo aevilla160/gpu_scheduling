@@ -1,0 +1,19 @@
+{
+  "target_commit": "c4cc73d3a1802f64b1283d3ae06ed1dcdb6e3bab",
+  "base_origin": "Reconstructed by reversing the full local patch history; target commit is the original experiment checkout reported by git rev-parse.",
+  "validation": "git apply --check; forward application reproduces all five current source files byte-for-byte. No new CUDA rebuild performed during packaging.",
+  "base_sha256": {
+    "src/abstract_hardware_model.h": "6388e02a556a423c5ca65776688b299536031dfd575fa5803f79b5313f7c4e05",
+    "src/gpgpu-sim/shader.h": "50e348eca4ea046861c9b887a380806845d7e49e4375252f4d5a26c5471c1d5c",
+    "src/gpgpu-sim/shader.cc": "3aab5226073e2a33fe33a69f49d07b24953b24c27ec18f4c3f234e27e2d502b8",
+    "src/gpgpu-sim/gpu-sim.cc": "3c14f58e19092e95df6c633611c7a9307c687d52a6b8f8fea09109f67e4a9658",
+    "src/gpgpu-sim/scoreboard.h": "cd274cbc6ea7fb1e6516f31425db6e28aa0397efd2df7d484e4a60e5ede417a7"
+  },
+  "patched_sha256": {
+    "src/abstract_hardware_model.h": "0fcc11b3efcf704ad44567d7febdabb8fcc5e1ddee076fa1792767a7de19b709",
+    "src/gpgpu-sim/shader.h": "c493aa7246f4b40e821dfaae1f9c9871fab2a8f4c9e123f9e4e54b3f42a1d92b",
+    "src/gpgpu-sim/shader.cc": "8695ff4435c47103133eafe6a1728510de5b957c9bfe07e0764c0d2e82e3b97a",
+    "src/gpgpu-sim/gpu-sim.cc": "2c27456812b1313575b4208d097da9ce2a653ffdc53ee072470e6fcc4ddafb34",
+    "src/gpgpu-sim/scoreboard.h": "628cb36a8ef93b3d26076a10e2f4bd32c5c5f50523ebbc997c835d80d4676369"
+  }
+}
