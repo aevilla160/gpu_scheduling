@@ -1,0 +1,1625 @@
+diff --git a/src/abstract_hardware_model.h b/src/abstract_hardware_model.h
+index cf8bfdf..1f38299 100644
+--- a/src/abstract_hardware_model.h
++++ b/src/abstract_hardware_model.h
+@@ -45,6 +45,7 @@
+ #include <map>
+ #include <memory>
+ #include <unordered_set>
++#include <unordered_map>
+ #include <vector>
+ #include "statistics.h"
+ #include "utils.h"
+@@ -1671,6 +1672,12 @@ class warp_inst_t : public inst_t {
+     return m_per_scalar_thread[n].memreqaddr[0];
+   }
+ 
++  const std::vector<new_addr_type> &locality_addresses(unsigned lane) const {
++    assert(m_per_scalar_thread_valid);
++    return m_per_scalar_thread[lane].memreqaddr;
++  }
++  bool locality_addresses_valid() const { return m_per_scalar_thread_valid; }
++
+   bool isatomic() const { return m_isatomic; }
+ 
+   unsigned warp_size() const { return m_config->warp_size; }
+diff --git a/src/gpgpu-sim/gpu-sim.cc b/src/gpgpu-sim/gpu-sim.cc
+index c0dddef..8221850 100644
+--- a/src/gpgpu-sim/gpu-sim.cc
++++ b/src/gpgpu-sim/gpu-sim.cc
+@@ -659,7 +659,7 @@ void shader_core_config::reg_options(class OptionParser *opp) {
+       "1");
+   option_parser_register(
+       opp, "-gpgpu_scheduler", OPT_CSTR, &gpgpu_scheduler_string,
+-      "Scheduler configuration: < lrr | gto | two_level_active > "
++      "Scheduler configuration: < lrr | gto | dav | lav | ldav | two_level_active > "
+       "If "
+       "two_level_active:<num_active_warps>:<inner_prioritization>:<outer_"
+       "prioritization>"
+@@ -667,6 +667,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
+       "scheduler_prioritization_type"
+       "Default: gto",
+       "gto");
++  option_parser_register(opp, "-gpgpu_priority_fetch", OPT_BOOL,
++                         &gpgpu_priority_fetch,
++                         "Priority bundle fetch for dav/lav/ldav", "0");
++  option_parser_register(opp, "-gpgpu_locality_predictor", OPT_UINT32,
++                         &gpgpu_locality_predictor,
++                         "Locality predictor: 0 per-warp EMA, 1 bounded per-PC EMA", "0");
++  option_parser_register(opp, "-gpgpu_ld_alpha", OPT_UINT32,
++                         &gpgpu_ld_alpha,
++                         "LDAV divergence weight in thousandths, range 0..1000",
++                         "500");
+ 
+   option_parser_register(
+       opp, "-gpgpu_concurrent_kernel_sm", OPT_BOOL, &gpgpu_concurrent_kernel_sm,
+diff --git a/src/gpgpu-sim/scoreboard.h b/src/gpgpu-sim/scoreboard.h
+index 8a275b8..cccfc32 100644
+--- a/src/gpgpu-sim/scoreboard.h
++++ b/src/gpgpu-sim/scoreboard.h
+@@ -48,6 +48,7 @@ class Scoreboard {
+ 
+   bool checkCollision(unsigned wid, const inst_t *inst) const;
+   bool pendingWrites(unsigned wid) const;
++  bool hasLongop(unsigned wid) const { return !longopregs[wid].empty(); }
+   void printContents() const;
+   const bool islongop(unsigned warp_id, unsigned regnum);
+ 
+diff --git a/src/gpgpu-sim/shader.cc b/src/gpgpu-sim/shader.cc
+index d0eb11c..23dff65 100644
+--- a/src/gpgpu-sim/shader.cc
++++ b/src/gpgpu-sim/shader.cc
+@@ -34,6 +34,8 @@
+ #include <float.h>
+ #include <limits.h>
+ #include <string.h>
++#include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <cstdint>
+ #include "../../libcuda/gpgpu_context.h"
+@@ -192,7 +194,9 @@ void shader_core_ctx::create_schedulers() {
+   // must currently occur after all inputs have been initialized.
+   std::string sched_config = m_config->gpgpu_scheduler_string;
+   const concrete_scheduler scheduler =
+-      sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
++      (sched_config == "dav" || sched_config == "lav" || sched_config == "ldav" || sched_config == "stall")
++          ? CONCRETE_SCHEDULER_DAV
++      : sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+       : sched_config.find("two_level_active") != std::string::npos
+           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
+       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
+@@ -203,6 +207,19 @@ void shader_core_ctx::create_schedulers() {
+           ? CONCRETE_SCHEDULER_WARP_LIMITING
+           : NUM_CONCRETE_SCHEDULERS;
+   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
++  if (m_config->gpgpu_priority_fetch && sched_config != "dav" &&
++      sched_config != "lav" && sched_config != "ldav") {
++    fprintf(stderr, "Priority fetch requires dav, lav or ldav scheduler\n");
++    abort();
++  }
++  if (m_config->gpgpu_locality_predictor > 1) {
++    fprintf(stderr, "-gpgpu_locality_predictor must be 0 (EMA) or 1 (PC)\n");
++    abort();
++  }
++  if (sched_config == "ldav" && m_config->gpgpu_ld_alpha > 1000) {
++    fprintf(stderr, "-gpgpu_ld_alpha must be in [0,1000]\n");
++    abort();
++  }
+ 
+   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
+     switch (scheduler) {
+@@ -230,6 +247,14 @@ void shader_core_ctx::create_schedulers() {
+             &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+             &m_pipeline_reg[ID_OC_MEM], i));
+         break;
++      case CONCRETE_SCHEDULER_DAV:
++        schedulers.push_back(new dav_scheduler(
++            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
++            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
++            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
++            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
++            &m_pipeline_reg[ID_OC_MEM], i));
++        break;
+       case CONCRETE_SCHEDULER_RRR:
+         schedulers.push_back(new rrr_scheduler(
+             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+@@ -492,6 +517,15 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
+   m_cluster = cluster;
+   m_config = config;
+   m_memory_config = mem_config;
++  m_priority_last_issued = (unsigned)-1;
++  m_locality_enabled =
++      (!strcmp(config->gpgpu_scheduler_string, "lav") ||
++       !strcmp(config->gpgpu_scheduler_string, "ldav")) &&
++      !config->m_L1D_config.disabled();
++  if (m_locality_enabled) {
++    m_locality_lines.reserve(config->warp_size * 2);
++    m_locality_lane_lines.reserve(4);
++  }
+   m_stats = stats;
+   // unsigned warp_size = config->warp_size;
+   Issue_Prio = 0;
+@@ -627,6 +661,76 @@ float shader_core_ctx::get_current_occupancy(unsigned long long &active,
+ }
+ 
+ void shader_core_stats::print(FILE *fout) const {
++  fprintf(fout, "proposal_order_calls = %llu\n", proposal_order_calls);
++  fprintf(fout, "proposal_order_ns = %llu\n", proposal_order_ns);
++  fprintf(fout, "proposal_altcmp_samples_changed = %llu\n", proposal_altcmp_samples_changed);
++  fprintf(fout, "proposal_altcmp_calls = %llu\n", proposal_altcmp_calls);
++  fprintf(fout, "proposal_altcmp_multi_runnable = %llu\n", proposal_altcmp_multi_runnable);
++  fprintf(fout, "proposal_altcmp_score_diff_warps = %llu\n", proposal_altcmp_score_diff_warps);
++  fprintf(fout, "proposal_altcmp_top_differs = %llu\n", proposal_altcmp_top_differs);
++  fprintf(fout, "proposal_altcmp_multi_ready = %llu\n", proposal_altcmp_multi_ready);
++  fprintf(fout, "proposal_altcmp_top_ready_differs = %llu\n", proposal_altcmp_top_ready_differs);
++  fprintf(fout, "proposal_altcmp_order_differs = %llu\n", proposal_altcmp_order_differs);
++  fprintf(fout, "proposal_lls_l1_observations = %llu\n", proposal_lls_l1_observations);
++  fprintf(fout, "proposal_lls_lost_sectors = %llu\n", proposal_lls_lost_sectors);
++  fprintf(fout, "proposal_lls_admit_calls = %llu\n", proposal_lls_admit_calls);
++  fprintf(fout, "proposal_lls_admitted_sum = %llu\n", proposal_lls_admitted_sum);
++  fprintf(fout, "proposal_lls_runnable_sum = %llu\n", proposal_lls_runnable_sum);
++  fprintf(fout, "proposal_lls_ctl_windows = %llu\n", proposal_lls_ctl_windows);
++  fprintf(fout, "proposal_lls_ctl_n_sum = %llu\n", proposal_lls_ctl_n_sum);
++  fprintf(fout, "proposal_lls_ctl_down = %llu\n", proposal_lls_ctl_down);
++  fprintf(fout, "proposal_lls_ctl_up = %llu\n", proposal_lls_ctl_up);
++  fprintf(fout, "proposal_daws_calls = %llu\n", proposal_daws_calls);
++  fprintf(fout, "proposal_daws_throttled_calls = %llu\n", proposal_daws_throttled_calls);
++  fprintf(fout, "proposal_daws_warp_footprint_sum = %llu\n", proposal_daws_warp_footprint_sum);
++  fprintf(fout, "proposal_daws_admitted_sum = %llu\n", proposal_daws_admitted_sum);
++  fprintf(fout, "proposal_daws_runnable_sum = %llu\n", proposal_daws_runnable_sum);
++  fprintf(fout, "proposal_daws_counted_sum = %llu\n", proposal_daws_counted_sum);
++  fprintf(fout, "proposal_warp_samples = %llu\n", proposal_warp_samples);
++  fprintf(fout, "proposal_active_lanes = %llu\n", proposal_active_lanes);
++  fprintf(fout, "proposal_lane_slots = %llu\n", proposal_lane_slots);
++  fprintf(fout, "proposal_divergent_warp_cycles = %llu\n", proposal_divergent_warp_cycles);
++  fprintf(fout, "proposal_memory_dependency_warp_cycles = %llu\n", proposal_memory_dependency_warp_cycles);
++  fprintf(fout, "proposal_memory_dependency_scheduler_cycles = %llu\n", proposal_memory_dependency_scheduler_cycles);
++  fprintf(fout, "proposal_lower_read_requests = %llu\n", made_read_mfs);
++  fprintf(fout, "proposal_lower_write_requests = %llu\n", made_write_mfs);
++  fprintf(fout, "proposal_locality_samples = %llu\n", proposal_locality_samples);
++  fprintf(fout, "proposal_reuse_total_bytes = %llu\n",
++        proposal_reuse_total_bytes);
++fprintf(fout, "proposal_reuse_spatial_bytes = %llu\n",
++        proposal_reuse_spatial_bytes);
++fprintf(fout, "proposal_reuse_temporal_bytes = %llu\n",
++        proposal_reuse_temporal_bytes);
++fprintf(fout, "proposal_reuse_history_miss_bytes = %llu\n",
++        proposal_reuse_history_miss_bytes);
++  fprintf(fout, "proposal_locality_references = %llu\n", proposal_locality_references);
++  fprintf(fout, "proposal_locality_unique_lines = %llu\n", proposal_locality_unique_lines);
++  fprintf(fout, "proposal_locality_score_sum = %llu\n", proposal_locality_score_sum);
++  fprintf(fout, "proposal_locality_tracking_ns = %llu\n", proposal_locality_tracking_ns);
++  fprintf(fout, "proposal_locality_prediction_count = %llu\n", proposal_locality_prediction_count);
++  fprintf(fout, "proposal_locality_prediction_abs_error = %llu\n", proposal_locality_prediction_abs_error);
++  fprintf(fout, "proposal_locality_constant_abs_error = %llu\n", proposal_locality_constant_abs_error);
++  fprintf(fout, "proposal_buffer_slots = %llu\n", proposal_buffer_slots);
++  fprintf(fout, "proposal_empty_buffer_warp_cycles = %llu\n", proposal_empty_buffer_warp_cycles);
++  fprintf(fout, "proposal_icache_pending_warp_cycles = %llu\n", proposal_icache_pending_warp_cycles);
++  fprintf(fout, "proposal_barrier_flag_warp_cycles = %llu\n", proposal_barrier_flag_warp_cycles);
++  fprintf(fout, "proposal_atomic_wait_warp_cycles = %llu\n", proposal_atomic_wait_warp_cycles);
++  fprintf(fout, "proposal_async_wait_flag_warp_cycles = %llu\n", proposal_async_wait_flag_warp_cycles);
++  fprintf(fout, "proposal_scoreboard_warp_cycles = %llu\n", proposal_scoreboard_warp_cycles);
++  fprintf(fout, "proposal_wrong_path_warp_cycles = %llu\n", proposal_wrong_path_warp_cycles);
++  fprintf(fout, "proposal_null_head_warp_cycles = %llu\n", proposal_null_head_warp_cycles);
++  fprintf(fout, "proposal_top_warp_cycles = %llu\n", proposal_top_warp_cycles);
++  fprintf(fout, "proposal_top_empty_cycles = %llu\n", proposal_top_empty_cycles);
++  fprintf(fout, "proposal_top_empty_icache_pending_cycles = %llu\n", proposal_top_empty_icache_pending_cycles);
++  fprintf(fout, "proposal_top_empty_no_wait_flags_cycles = %llu\n", proposal_top_empty_no_wait_flags_cycles);
++  fprintf(fout, "proposal_top_empty_other_issued_cycles = %llu\n", proposal_top_empty_other_issued_cycles);
++  fprintf(fout, "proposal_top_empty_no_issue_cycles = %llu\n", proposal_top_empty_no_issue_cycles);
++  fprintf(fout, "proposal_pipeline_or_dispatch_stall_cycles = %llu\n", proposal_pipeline_or_dispatch_stall_cycles);
++  fprintf(fout, "proposal_pc_prediction_count = %llu\n", proposal_pc_prediction_count);
++  fprintf(fout, "proposal_pc_warm_prediction_count = %llu\n", proposal_pc_warm_prediction_count);
++  fprintf(fout, "proposal_pc_prediction_abs_error = %llu\n", proposal_pc_prediction_abs_error);
++  fprintf(fout, "proposal_ema_all_prediction_abs_error = %llu\n", proposal_ema_all_prediction_abs_error);
++  fprintf(fout, "proposal_neutral_all_prediction_abs_error = %llu\n", proposal_neutral_all_prediction_abs_error);
+   unsigned long long thread_icount_uarch = 0;
+   unsigned long long warp_icount_uarch = 0;
+ 
+@@ -956,6 +1060,33 @@ void shader_core_ctx::fetch() {
+       m_warp[mf->get_wid()]->set_last_fetch(m_gpu->gpu_sim_cycle);
+       delete mf;
+     } else {
++      unsigned priority_warp = (unsigned)-1;
++      if (m_config->gpgpu_priority_fetch) {
++        unsigned alpha = !strcmp(m_config->gpgpu_scheduler_string, "dav") ? 1000 :
++            !strcmp(m_config->gpgpu_scheduler_string, "lav") ? 0 : m_config->gpgpu_ld_alpha;
++        unsigned long long best_score = 0;
++        bool best_greedy = false;
++        unsigned best_age = (unsigned)-1;
++        for (unsigned wid = 0; wid < m_config->max_warps_per_shader; ++wid) {
++          auto *w = m_warp[wid];
++          // Native decode writes a complete two-slot bundle. Admit only an
++          // empty buffer; partial refill would overwrite a live instruction.
++          if (w->done_exit() || w->functional_done() || w->imiss_pending() ||
++              !w->ibuffer_empty()) continue;
++          unsigned active = m_simt_stack[wid]->get_active_mask().count();
++          unsigned long long score = alpha * (1024ULL * active / m_config->warp_size) +
++              (1000-alpha) * static_cast<unsigned long long>(
++                  w->predicted_locality(m_config->gpgpu_locality_predictor));
++          bool greedy = wid == m_priority_last_issued;
++          unsigned age = w->get_dynamic_warp_id();
++          if (priority_warp == (unsigned)-1 || score > best_score ||
++              (score == best_score && greedy > best_greedy) ||
++              (score == best_score && greedy == best_greedy && age < best_age)) {
++            priority_warp = wid; best_score = score;
++            best_greedy = greedy; best_age = age;
++          }
++        }
++      }
+       // find an active warp with space in instruction buffer that is not
+       // already waiting on a cache miss and get next 1-2 instructions from
+       // i-cache...
+@@ -992,7 +1123,8 @@ void shader_core_ctx::fetch() {
+         }
+ 
+         // this code fetches instructions from the i-cache or generates memory
+-        if (!m_warp[warp_id]->functional_done() &&
++        if ((!m_config->gpgpu_priority_fetch || warp_id == priority_warp) &&
++            !m_warp[warp_id]->functional_done() &&
+             !m_warp[warp_id]->imiss_pending() &&
+             m_warp[warp_id]->ibuffer_empty()) {
+           address_type pc;
+@@ -1069,6 +1201,92 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
+       m_warp[warp_id]->get_streamID());  // dynamic instruction information
+   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
+   func_exec_inst(**pipe_reg);
++  if (m_config->gpgpu_priority_fetch) m_priority_last_issued = warp_id;
++  {
++    static const char *mode_env = getenv("LLS_MODE");
++    static const bool daws2 = mode_env && atoi(mode_env) == 5;
++    if (daws2) m_warp[warp_id]->daws2_issue_pc(next_inst->pc);
++  }
++  // Post-execution observation only: no future addresses are evaluated.
++  // Fixed-size per-warp EMA history is cleared on reset/init.
++  if (m_locality_enabled) {
++    const warp_inst_t &observed = **pipe_reg;
++    if (observed.op == LOAD_OP &&
++        observed.space.get_type() == global_space && !observed.isatomic() &&
++        observed.locality_addresses_valid() && observed.data_size > 0) {
++      auto start = std::chrono::steady_clock::now();
++      const unsigned line_size = m_config->m_L1D_config.get_line_sz();
++      auto &lines = m_locality_lines;
++      lines.clear();
++      unsigned references = 0;
++      for (unsigned lane = 0; lane < m_config->warp_size; ++lane) {
++        if (!observed.get_active_mask().test(lane)) continue;
++        auto &lane_lines = m_locality_lane_lines;
++        lane_lines.clear();
++        for (auto addr : observed.locality_addresses(lane)) {
++          auto first = addr / line_size;
++          auto last = (addr + observed.data_size - 1) / line_size;
++          for (auto line = first; line <= last; ++line) lane_lines.push_back(line);
++        }
++        std::sort(lane_lines.begin(), lane_lines.end());
++        lane_lines.erase(std::unique(lane_lines.begin(), lane_lines.end()), lane_lines.end());
++        references += lane_lines.size();
++        lines.insert(lines.end(), lane_lines.begin(), lane_lines.end());
++      }
++      std::sort(lines.begin(), lines.end());
++      lines.erase(std::unique(lines.begin(), lines.end()), lines.end());
++      if (references) {
++        // Recent intra-warp spatial reuse, bounded [0,1024].
++// This is address-history evidence, not a cache-hit measurement.
++unsigned long long reuse_bytes[4] = {0, 0, 0, 0};
++
++unsigned score =
++    m_warp[warp_id]->sample_spatial_locality(
++        observed, line_size, reuse_bytes);
++
++m_stats->proposal_reuse_total_bytes += reuse_bytes[0];
++m_stats->proposal_reuse_spatial_bytes += reuse_bytes[1];
++m_stats->proposal_reuse_temporal_bytes += reuse_bytes[2];
++m_stats->proposal_reuse_history_miss_bytes += reuse_bytes[3];
++        // Read-only one-step forecast evaluation; priority/EMA are unchanged.
++        if (m_warp[warp_id]->locality_history_valid()) {
++          unsigned prediction = m_warp[warp_id]->locality_score();
++          ++m_stats->proposal_locality_prediction_count;
++          m_stats->proposal_locality_prediction_abs_error +=
++              prediction > score ? prediction-score : score-prediction;
++          m_stats->proposal_locality_constant_abs_error +=
++              score > 512 ? score-512 : 512-score;
++        }
++        // All-sample comparison includes cold starts for both predictors.
++        unsigned pc_prediction = m_warp[warp_id]->pc_locality_score(observed.pc);
++        unsigned ema_prediction = m_warp[warp_id]->locality_score();
++        ++m_stats->proposal_pc_prediction_count;
++        if (m_warp[warp_id]->pc_locality_valid(observed.pc))
++          ++m_stats->proposal_pc_warm_prediction_count;
++        m_stats->proposal_pc_prediction_abs_error +=
++            pc_prediction > score ? pc_prediction-score : score-pc_prediction;
++        m_stats->proposal_ema_all_prediction_abs_error +=
++            ema_prediction > score ? ema_prediction-score : score-ema_prediction;
++        m_stats->proposal_neutral_all_prediction_abs_error +=
++            score > 512 ? score-512 : 512-score;
++        m_warp[warp_id]->observe_pc_locality(observed.pc, score);
++        // Observe-only shadow: old formula (spatial bytes only).
++        unsigned alt_score = reuse_bytes[0]
++            ? static_cast<unsigned>(1024ULL * reuse_bytes[1] / reuse_bytes[0])
++            : 0;
++        if (alt_score != score) ++m_stats->proposal_altcmp_samples_changed;
++        m_warp[warp_id]->observe_pc_locality_alt(observed.pc, alt_score);
++        m_warp[warp_id]->observe_locality(score);
++        ++m_stats->proposal_locality_samples;
++        m_stats->proposal_locality_references += references;
++        m_stats->proposal_locality_unique_lines += lines.size();
++        m_stats->proposal_locality_score_sum += score;
++      }
++      m_stats->proposal_locality_tracking_ns += std::chrono::duration_cast<
++          std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
++    }
++  }
++
+ 
+   // Add LDGSTS instructions into a buffer
+   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
+@@ -1483,7 +1701,84 @@ void scheduler_unit::cycle() {
+                              // waiting for pending register writes
+   bool issued_inst = false;  // of these we issued one
+ 
++  // Observe every resident live warp once per scheduler cycle. Do not call
++  // waiting() here: that method can change memory-barrier state.
++  // Snapshot raw flags only: waiting() has side effects and must not be
++  // invoked for instrumentation. Raw flags are not a readiness oracle.
++  auto proposal_wait_flags = [this](shd_warp_t *w) {
++    bool barrier = m_shader->warp_waiting_at_barrier(w->get_warp_id()) ||
++                   w->get_membar();
++    for (unsigned lane = 0; lane < m_shader->m_config->warp_size; ++lane)
++      barrier = barrier || w->get_mbarrier_waiting(lane);
++    bool async_wait = w->proposal_async_wait_flag();
++    bool sleep = w->is_nanosleeping(m_shader->m_gpu->gpu_sim_cycle +
++                                   m_shader->m_gpu->gpu_tot_sim_cycle);
++    return (barrier ? 1u : 0u) | (w->get_n_atomic() ? 2u : 0u) |
++           (async_wait ? 4u : 0u) | (sleep ? 8u : 0u);
++  };
++  bool proposal_live = false;
++  bool proposal_mem_blocked = false;
++  for (auto *w : m_supervised_warps) {
++    if (!w || w->done_exit() || w->functional_done()) continue;
++    proposal_live = true;
++    unsigned wid = w->get_warp_id();
++    unsigned active = m_simt_stack[wid]->get_active_mask().count();
++    ++m_stats->proposal_warp_samples;
++    m_stats->proposal_active_lanes += active;
++    m_stats->proposal_lane_slots += m_shader->m_config->warp_size;
++    if (active < m_shader->m_config->warp_size)
++      ++m_stats->proposal_divergent_warp_cycles;
++    m_stats->proposal_buffer_slots += w->num_inst_in_buffer();
++    if (w->ibuffer_empty()) ++m_stats->proposal_empty_buffer_warp_cycles;
++    if (w->imiss_pending()) ++m_stats->proposal_icache_pending_warp_cycles;
++    unsigned wait_flags = proposal_wait_flags(w);
++    if (wait_flags & 1u) ++m_stats->proposal_barrier_flag_warp_cycles;
++    if (wait_flags & 2u) ++m_stats->proposal_atomic_wait_warp_cycles;
++    if (wait_flags & 4u) ++m_stats->proposal_async_wait_flag_warp_cycles;
++    const warp_inst_t *inst = w->ibuffer_empty() ? NULL : w->ibuffer_next_inst();
++    if (!inst && !w->ibuffer_empty()) ++m_stats->proposal_null_head_warp_cycles;
++    if (!inst) continue;
++    unsigned pc, rpc;
++    m_simt_stack[wid]->get_pdom_stack_top_info(&pc, &rpc);
++    if (inst->pc != pc) {
++      ++m_stats->proposal_wrong_path_warp_cycles;
++      continue;
++    }
++    if (m_scoreboard->checkCollision(wid, inst))
++      ++m_stats->proposal_scoreboard_warp_cycles;
++    bool blocked = false;
++    for (unsigned i = 0; i < MAX_INPUT_VALUES; ++i)
++      if (inst->in[i] > 0 && m_scoreboard->islongop(wid, inst->in[i]))
++        blocked = true;
++    if (blocked) {
++      ++m_stats->proposal_memory_dependency_warp_cycles;
++      proposal_mem_blocked = true;
++    }
++  }
++  if (proposal_mem_blocked)
++    ++m_stats->proposal_memory_dependency_scheduler_cycles;
++  // Host-side ordering cost only; no simulated hardware delay is introduced.
++  std::chrono::steady_clock::time_point proposal_start;
++  if (proposal_live) proposal_start = std::chrono::steady_clock::now();
+   order_warps();
++  if (proposal_live) {
++    ++m_stats->proposal_order_calls;
++    m_stats->proposal_order_ns += std::chrono::duration_cast<
++        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proposal_start).count();
++  }
++  bool proposal_top_empty = false;
++  for (auto *w : m_next_cycle_prioritized_warps) {
++    if (!w || w->done_exit() || w->functional_done()) continue;
++    ++m_stats->proposal_top_warp_cycles;
++    proposal_top_empty = w->ibuffer_empty();
++    if (proposal_top_empty) {
++      ++m_stats->proposal_top_empty_cycles;
++      if (w->imiss_pending()) ++m_stats->proposal_top_empty_icache_pending_cycles;
++      if (!proposal_wait_flags(w))
++        ++m_stats->proposal_top_empty_no_wait_flags_cycles;
++    }
++    break;
++  }
+   for (std::vector<shd_warp_t *>::const_iterator iter =
+            m_next_cycle_prioritized_warps.begin();
+        iter != m_next_cycle_prioritized_warps.end(); iter++) {
+@@ -1560,6 +1855,11 @@ void scheduler_unit::cycle() {
+ 
+             assert(warp(warp_id).inst_in_pipeline());
+ 
++            // DAWS (LLS_MODE=4): hold global loads of warps whose predicted
++            // footprint does not fit in the effective cache.
++            if (pI->op == LOAD_OP && warp(warp_id).daws_block() &&
++                pI->space.get_type() == global_space)
++              break;
+             if ((pI->op == LOAD_OP) || (pI->op == STORE_OP) ||
+                 (pI->op == MEMORY_BARRIER_OP) ||
+                 (pI->op == TENSOR_CORE_LOAD_OP) ||
+@@ -1782,6 +2082,13 @@ void scheduler_unit::cycle() {
+     }
+   }
+ 
++  if (proposal_top_empty) {
++    if (issued_inst) ++m_stats->proposal_top_empty_other_issued_cycles;
++    else ++m_stats->proposal_top_empty_no_issue_cycles;
++  }
++  if (proposal_live && ready_inst && !issued_inst)
++    ++m_stats->proposal_pipeline_or_dispatch_stall_cycles;
++
+   // issue stall statistics:
+   if (!valid_inst)
+     m_stats->shader_cycle_distro[0]++;  // idle or control hazard
+@@ -1831,6 +2138,502 @@ void gto_scheduler::order_warps() {
+                     scheduler_unit::sort_warps_by_oldest_dynamic_id);
+ }
+ 
++void dav_scheduler::done_adding_supervised_warps() {
++  gto_scheduler::done_adding_supervised_warps();
++  const auto *config = m_shader->get_config();
++  const char *policy = config->gpgpu_scheduler_string;
++  unsigned alpha = !strcmp(policy, "dav") ? 1000 :
++      !strcmp(policy, "lav") ? 0 : config->gpgpu_ld_alpha;
++  m_locality_weight = 1000 - alpha;
++  m_prediction_mode = config->gpgpu_locality_predictor;
++  m_stall_aware = !strcmp(policy, "stall");
++  // LAV-limit is enabled by environment variable so no config option is needed.
++  const char *limit = getenv("LAV_WARP_LIMIT");
++  m_warp_limit = (limit && !m_stall_aware) ? atoi(limit) : 0;
++  const char *lls_mode = getenv("LLS_MODE");
++  m_lls_mode = (lls_mode && !m_stall_aware) ? atoi(lls_mode) : 0;
++  const char *lls_k = getenv("LLS_K");
++  m_lls_k = lls_k ? atoi(lls_k) : 8;
++  if (!m_lls_k) m_lls_k = 1;
++  const char *lls_window = getenv("LLS_WINDOW");
++  m_ctl_window = lls_window ? atoi(lls_window) : 2000;
++  if (!m_ctl_window) m_ctl_window = 1;
++  const char *lls_hi = getenv("LLS_HI");
++  m_ctl_hi = lls_hi ? atoi(lls_hi) : 200;
++  const char *lls_lo = getenv("LLS_LO");
++  m_ctl_lo = lls_lo ? atoi(lls_lo) : 60;
++  m_ctl_n = m_supervised_warps.size();
++  m_ctl_calls = 0;
++  // DAWS budget: this scheduler's share of the L1 lines, times LLS_EFF %.
++  const char *l1_lines = getenv("LLS_L1_LINES");
++  const char *eff = getenv("LLS_EFF");
++  const char *reuse_pct = getenv("LLS_REUSE_PCT");
++  unsigned lines = l1_lines ? atoi(l1_lines) : 2048;  // 256 KB / 128 B
++  unsigned eff_pct = eff ? atoi(eff) : 100;
++  unsigned nsched = config->gpgpu_num_sched_per_core
++                        ? config->gpgpu_num_sched_per_core : 1;
++  // Eff cache size = kAssocFactor (LLS_EFF %) x total lines (DAWS Eq. 1),
++  // split evenly over the SM's schedulers.
++  m_daws_budget = 1ULL * lines * eff_pct / 100 / nsched;
++  m_daws_reuse_pct = reuse_pct ? atoi(reuse_pct) : 25;
++  const char *warp_reuse = getenv("LLS_WARP_REUSE");
++  m_daws_warp_reuse_pct = warp_reuse ? atoi(warp_reuse) : 70;
++  static bool reported = false;
++  if (!reported) {
++    printf("LAV_WARP_LIMIT = %u\n", m_warp_limit);
++    printf("LLS_MODE = %u LLS_K = %u\n", m_lls_mode, m_lls_k);
++    printf("LLS_WINDOW = %u LLS_HI = %u LLS_LO = %u (1/10000)\n",
++           m_ctl_window, m_ctl_hi, m_ctl_lo);
++    printf("DAWS L1_LINES = %u EFF = %u%% sched = %u budget = %llu lines "
++           "REUSE_PCT = %u\n", lines, eff_pct, nsched,
++           m_daws_budget, m_daws_reuse_pct);
++    printf("DAWS2 LLS_WARP_REUSE = %u\n", m_daws_warp_reuse_pct);
++    reported = true;
++  }
++  assert(config->warp_size <= MAX_WARP_SIZE);
++  for (unsigned active = 0; active <= config->warp_size; ++active)
++    m_weighted_divergence[active] = alpha * (1024ULL * active / config->warp_size);
++  m_candidates.reserve(m_supervised_warps.size());
++  m_next_cycle_prioritized_warps.reserve(m_supervised_warps.size());
++}
++
++void dav_scheduler::order_warps() {
++    struct divergence_stats {
++    unsigned long long calls = 0;
++    unsigned long long multi_candidate = 0;
++    unsigned long long different_active = 0;
++    unsigned long long active_hist[MAX_WARP_SIZE + 1] = {};
++
++    ~divergence_stats() {
++      printf("\nDIVCHECK scheduler_calls=%llu multi_candidate=%llu "
++             "different_active=%llu\n",
++             calls, multi_candidate, different_active);
++
++      for (unsigned a = 0; a <= MAX_WARP_SIZE; ++a) {
++        if (active_hist[a])
++          printf("DIVCHECK active=%u observations=%llu\n",
++                 a, active_hist[a]);
++      }
++    }
++  };
++
++  static divergence_stats stats;
++
++  const bool check_divergence =
++      !strcmp(m_shader->get_config()->gpgpu_scheduler_string, "dav");
++
++  unsigned runnable_count = 0;
++  unsigned min_active = MAX_WARP_SIZE;
++  unsigned max_active = 0;
++  m_candidates.clear();
++  shd_warp_t *last = m_last_supervised_issued == m_supervised_warps.end()
++                         ? NULL : *m_last_supervised_issued;
++  unsigned position = 0;
++  for (auto *w : m_supervised_warps) {
++    if (!w) continue;
++    // Preserve exactly one waiting() call, in the original traversal order.
++    bool runnable = !w->done_exit() && !w->functional_done() && !w->waiting();
++    unsigned active = runnable
++        ? m_simt_stack[w->get_warp_id()]->get_active_mask().count() : 0;
++            if (check_divergence && runnable) {
++      ++runnable_count;
++      ++stats.active_hist[active];
++      if (active < min_active) min_active = active;
++      if (active > max_active) max_active = active;
++    }
++    unsigned long long score = m_weighted_divergence[active] +
++        m_locality_weight * static_cast<unsigned long long>(w->predicted_locality(m_prediction_mode));
++    // Explicit baseline: runnable first, then no outstanding long-latency
++    // destination register, then GTO. This is a project-defined baseline.
++    if (m_stall_aware) score = runnable && !m_scoreboard->hasLongop(w->get_warp_id());
++    m_candidates.push_back({w, score, runnable, w == last,
++                            w->get_dynamic_warp_id(), position++});
++  }
++    if (check_divergence) {
++    ++stats.calls;
++
++    if (runnable_count >= 2) {
++      ++stats.multi_candidate;
++
++      if (min_active != max_active)
++        ++stats.different_active;
++    }
++  }
++  // Explicit original-position tie break reproduces stable_sort semantics,
++    // Diagnostic snapshot for the first issue of this scheduler cycle.
++  // Reuse c.runnable: never call waiting() again for instrumentation.
++  if (check_divergence) {
++    struct issue_snapshot_stats {
++      unsigned long long calls = 0;
++      unsigned long long has_eligible = 0;
++      unsigned long long multi_eligible = 0;
++      unsigned long long different_active = 0;
++      unsigned long long unsupported_heads = 0;
++
++      ~issue_snapshot_stats() {
++        printf("\nDIVREADY calls=%llu has_eligible=%llu "
++               "multi_eligible=%llu different_active=%llu "
++               "unsupported_heads=%llu\n",
++               calls, has_eligible, multi_eligible,
++               different_active, unsupported_heads);
++      }
++    };
++    static issue_snapshot_stats ready_stats;
++
++    unsigned eligible_count = 0;
++    unsigned eligible_min = MAX_WARP_SIZE;
++    unsigned eligible_max = 0;
++
++    auto pipe_free = [this](register_set *pipe) {
++      return pipe->has_free(m_shader->get_config()->sub_core_model, m_id);
++    };
++
++    for (const auto &c : m_candidates) {
++      shd_warp_t *w = c.warp;
++      if (!c.runnable || w->ibuffer_empty()) continue;
++
++      const warp_inst_t *inst = w->ibuffer_next_inst();
++      if (!inst || !w->ibuffer_next_valid()) continue;
++
++      // These operations require additional stateful checks.
++      // Exclude them rather than executing those checks twice.
++      if (inst->m_is_cdp || inst->is_syncs_try_wait()) {
++        ++ready_stats.unsupported_heads;
++        continue;
++      }
++
++      unsigned wid = w->get_warp_id();
++      unsigned pc, rpc;
++      m_simt_stack[wid]->get_pdom_stack_top_info(&pc, &rpc);
++      if (pc != inst->pc) continue;
++      if (m_scoreboard->checkCollision(wid, inst)) continue;
++
++      const auto *cfg = m_shader->get_config();
++      bool available = false;
++
++      if (inst->op == LOAD_OP || inst->op == STORE_OP ||
++          inst->op == MEMORY_BARRIER_OP ||
++          inst->op == TENSOR_CORE_LOAD_OP ||
++          inst->op == TENSOR_CORE_STORE_OP ||
++          inst->op == FENCE_OP || inst->op == SYNCS_OP ||
++          inst->op == TMA_OP || inst->op == ARRIVES_OP ||
++          inst->op == STAS_OP) {
++        available = pipe_free(m_mem_out);
++      } else if (inst->op != TENSOR_CORE_OP &&
++                 inst->op != SFU_OP &&
++                 inst->op != DP_OP &&
++                 !(inst->op >= SPEC_UNIT_START_ID)) {
++        if (cfg->gpgpu_num_int_units > 0 && inst->op != SP_OP) {
++          available = pipe_free(m_int_out);
++        } else if (cfg->gpgpu_num_sp_units > 0) {
++          available = pipe_free(m_sp_out);
++        }
++      } else if (cfg->gpgpu_num_dp_units > 0 &&
++                 inst->op == DP_OP) {
++        available = pipe_free(m_dp_out);
++      } else if ((cfg->gpgpu_num_dp_units == 0 &&
++                  inst->op == DP_OP) ||
++                 inst->op == SFU_OP || inst->op == ALU_SFU_OP) {
++        available = cfg->gpgpu_num_sfu_units > 0 &&
++                    pipe_free(m_sfu_out);
++      } else if (inst->op == TENSOR_CORE_OP) {
++        available = cfg->gpgpu_num_tensor_core_units > 0 &&
++                    pipe_free(m_tensor_core_out);
++      } else if (inst->op >= SPEC_UNIT_START_ID) {
++        unsigned sid = inst->op - SPEC_UNIT_START_ID;
++        available =
++            sid < cfg->m_specialized_unit.size() &&
++            cfg->m_specialized_unit[sid].num_units > 0 &&
++            pipe_free(m_spec_cores_out[sid]);
++      }
++
++      if (!available) continue;
++
++      unsigned active = m_simt_stack[wid]->get_active_mask().count();
++      ++eligible_count;
++      if (active < eligible_min) eligible_min = active;
++      if (active > eligible_max) eligible_max = active;
++    }
++
++    ++ready_stats.calls;
++    if (eligible_count > 0) ++ready_stats.has_eligible;
++    if (eligible_count >= 2) {
++      ++ready_stats.multi_eligible;
++      if (eligible_min != eligible_max)
++        ++ready_stats.different_active;
++    }
++  }
++  // Observe-only: rank the same candidates with the old-formula shadow
++  // scores and compare. Reads state only; scheduling is unchanged.
++  if (m_locality_weight && !m_stall_aware) {
++    auto better = [](const candidate &a, const candidate &b) {
++      if (a.runnable != b.runnable) return a.runnable > b.runnable;
++      if (a.score != b.score) return a.score > b.score;
++      if (a.greedy != b.greedy) return a.greedy > b.greedy;
++      if (a.age != b.age) return a.age < b.age;
++      return a.position < b.position;
++    };
++    std::vector<candidate> alt = m_candidates;
++    unsigned runnable = 0, ready = 0;
++    for (auto &c : alt) {
++      unsigned active = c.runnable
++          ? m_simt_stack[c.warp->get_warp_id()]->get_active_mask().count() : 0;
++      c.score = m_weighted_divergence[active] +
++          m_locality_weight * static_cast<unsigned long long>(
++              c.warp->predicted_locality_alt(m_prediction_mode));
++      if (!c.runnable) continue;
++      ++runnable;
++      if (!c.warp->ibuffer_empty()) ++ready;
++    }
++    ++m_stats->proposal_altcmp_calls;
++    for (unsigned i = 0; i < alt.size(); ++i)
++      if (alt[i].runnable && alt[i].score != m_candidates[i].score)
++        ++m_stats->proposal_altcmp_score_diff_warps;
++    // Top among runnable warps, and among runnable warps with a buffered
++    // instruction (closer to what can actually issue this cycle).
++    auto top = [&better](const std::vector<candidate> &v, bool need_inst) {
++      const candidate *best = NULL;
++      for (const auto &c : v) {
++        if (!c.runnable || (need_inst && c.warp->ibuffer_empty())) continue;
++        if (!best || better(c, *best)) best = &c;
++      }
++      return best ? best->warp : NULL;
++    };
++    if (runnable >= 2) {
++      ++m_stats->proposal_altcmp_multi_runnable;
++      if (top(alt, false) != top(m_candidates, false))
++        ++m_stats->proposal_altcmp_top_differs;
++      std::vector<candidate> cur = m_candidates;
++      std::sort(cur.begin(), cur.end(), better);
++      std::sort(alt.begin(), alt.end(), better);
++      for (unsigned i = 0; i < cur.size(); ++i) {
++        if (!cur[i].runnable) break;
++        if (cur[i].warp != alt[i].warp) {
++          ++m_stats->proposal_altcmp_order_differs;
++          break;
++        }
++      }
++    }
++    if (ready >= 2) {
++      ++m_stats->proposal_altcmp_multi_ready;
++      if (top(alt, true) != top(m_candidates, true))
++        ++m_stats->proposal_altcmp_top_ready_differs;
++    }
++  }
++  // including equal ages in inactive slots, without allocating a sort buffer.
++  std::sort(m_candidates.begin(), m_candidates.end(),
++      [](const candidate &a, const candidate &b) {
++        if (a.runnable != b.runnable) return a.runnable > b.runnable;
++        if (a.score != b.score) return a.score > b.score;
++        if (a.greedy != b.greedy) return a.greedy > b.greedy;
++        if (a.age != b.age) return a.age < b.age;
++        return a.position < b.position;
++      });
++  m_next_cycle_prioritized_warps.clear();
++  if (!m_warp_limit && m_lls_mode < 2) {
++    for (const auto &c : m_candidates)
++      m_next_cycle_prioritized_warps.push_back(c.warp);
++    return;
++  }
++  // LAV-limit: admit at most m_warp_limit runnable warps. Admission uses the
++  // per-warp locality history, quantized to 4 classes, then age, so the
++  // admitted set stays stable across cycles (the head-based score flips
++  // between load and non-load instructions every cycle).
++  // With LLS_MODE the admission key is the lost-locality score instead
++  // (quantized to 1/2 of the base weight, again for stability).
++  const bool use_lls = m_lls_mode != 0;
++  // Modes 1 and 2 rank by lost-locality score; mode 3 keeps GTO's age order
++  // so the admitted set stays the same warps from cycle to cycle.
++  const bool lls_key = m_lls_mode == 1 || m_lls_mode == 2;
++  std::vector<const candidate *> pool;
++  for (const auto &c : m_candidates)
++    if (c.runnable) pool.push_back(&c);  // waiting warps would deadlock barriers
++  const unsigned runnable = pool.size();
++  std::sort(pool.begin(), pool.end(),
++      [use_lls, lls_key](const candidate *a, const candidate *b) {
++        unsigned la = !use_lls ? a->warp->locality_score() >> 8
++                    : lls_key ? a->warp->lost_locality_score() >> 9 : 0;
++        unsigned lb = !use_lls ? b->warp->locality_score() >> 8
++                    : lls_key ? b->warp->lost_locality_score() >> 9 : 0;
++        if (la != lb) return la > lb;
++        if (a->age != b->age) return a->age < b->age;
++        return a->position < b->position;
++      });
++  if (m_lls_mode == 3) {
++    // Windowed feedback: every LLS_WINDOW scheduler cycles, look at the
++    // fraction of this scheduler's L1 load accesses that missed on data the
++    // same warp had touched before (lost locality). Above LLS_HI, admit one
++    // warp fewer; below LLS_LO, one more; in between, hold.
++    if (++m_ctl_calls >= m_ctl_window) {
++      m_ctl_calls = 0;
++      unsigned long long lost = 0, obs = 0;
++      unsigned live = 0;
++      for (auto *w : m_supervised_warps) {
++        if (!w) continue;
++        w->take_lost_window(lost, obs);
++        if (!w->done_exit()) ++live;
++      }
++      if (obs >= 64) {
++        if (lost * 10000 > obs * m_ctl_hi) {
++          if (m_ctl_n > 1) { --m_ctl_n; ++m_stats->proposal_lls_ctl_down; }
++        } else if (lost * 10000 < obs * m_ctl_lo) {
++          if (m_ctl_n < m_supervised_warps.size()) {
++            ++m_ctl_n;
++            ++m_stats->proposal_lls_ctl_up;
++          }
++        }
++      }
++      // Never sit above the number of live warps, so a cut takes effect
++      // right away instead of first walking down from the slot count.
++      if (live && m_ctl_n > live) m_ctl_n = live;
++      ++m_stats->proposal_lls_ctl_windows;
++      m_stats->proposal_lls_ctl_n_sum += m_ctl_n;
++    }
++    unsigned admit = m_ctl_n ? m_ctl_n : 1;
++    if (m_warp_limit && admit > m_warp_limit) admit = m_warp_limit;
++    if (pool.size() > admit) pool.resize(admit);
++  } else if (m_lls_mode == 4) {
++    // DAWS: predicted footprint per warp (Sec. 5.1.1): each diverged load
++    // contributes one line per active lane, each converged load two lines
++    // (one with a single active lane). Prefix sum from the oldest warp; a
++    // warp whose prefix sum exceeds the effective cache size may not issue
++    // global loads this cycle (it can still issue other instructions).
++    // Warps waiting at a barrier are not runnable and count zero. If one
++    // warp alone exceeds the budget, nothing is throttled.
++    unsigned n_div, n_conv;
++    const bool locality = m_shader->daws_classify(m_daws_reuse_pct, n_div,
++                                                  n_conv);
++    for (auto *w : m_supervised_warps)
++      if (w) w->set_daws_block(false);
++    ++m_stats->proposal_daws_calls;
++    const unsigned long long full_fp = 32ULL * n_div + 2ULL * n_conv;
++    m_stats->proposal_daws_warp_footprint_sum += full_fp;
++    m_stats->proposal_daws_runnable_sum += pool.size();
++    unsigned admit = pool.size();
++    if (locality && full_fp && full_fp <= m_daws_budget) {
++      unsigned long long total = 0;
++      admit = 0;
++      for (const candidate *c : pool) {
++        unsigned lanes =
++            m_simt_stack[c->warp->get_warp_id()]->get_active_mask().count();
++        unsigned long long fp = lanes > 1
++            ? 1ULL * lanes * n_div + 2ULL * n_conv : 1ULL * (n_div + n_conv);
++        if (admit && total + fp > m_daws_budget) break;
++        total += fp;
++        ++admit;
++      }
++      for (unsigned i = admit; i < pool.size(); ++i)
++        pool.at(i)->warp->set_daws_block(true);
++      if (admit < pool.size()) ++m_stats->proposal_daws_throttled_calls;
++    }
++    m_stats->proposal_daws_admitted_sum += admit;
++    // Blocked warps stay in the issue order; only their loads are held.
++  } else if (m_lls_mode == 5) {
++    // DAWS v2: same oldest-first prefix sum and load gate as mode 4, but
++    // each warp reserves its measured footprint (distinct reused lines per
++    // loop iteration) instead of a per-PC estimate. Warps with little
++    // cross-iteration reuse reserve nothing and are never held.
++    for (auto *w : m_supervised_warps)
++      if (w) w->set_daws_block(false);
++    ++m_stats->proposal_daws_calls;
++    m_stats->proposal_daws_runnable_sum += pool.size();
++    unsigned long long total = 0;
++    unsigned admit = 0, counted = 0;
++    for (const candidate *c : pool) {
++      unsigned fp = c->warp->daws2_footprint(m_daws_warp_reuse_pct);
++      if (fp > m_daws_budget) fp = 0;  // a warp alone over budget: no gate
++      if (fp) {
++        ++counted;
++        m_stats->proposal_daws_warp_footprint_sum += fp;
++      }
++      if (admit && total + fp > m_daws_budget) break;
++      total += fp;
++      ++admit;
++    }
++    for (unsigned i = admit; i < pool.size(); ++i) {
++      const candidate *c = pool.at(i);
++      unsigned fp = c->warp->daws2_footprint(m_daws_warp_reuse_pct);
++      if (fp && fp <= m_daws_budget)
++        c->warp->set_daws_block(true);
++      else
++        ++admit;  // warps with nothing to protect are never held
++    }
++    m_stats->proposal_daws_counted_sum += counted;
++    if (admit < pool.size()) ++m_stats->proposal_daws_throttled_calls;
++    m_stats->proposal_daws_admitted_sum += admit;
++  } else if (m_lls_mode == 6) {
++    // CCWS v2: lost-locality cutoff with a stable, age-ordered admitted set.
++    // Each warp weighs BASE plus its lost-locality score (rounded down to a
++    // multiple of BASE/2, so small noise counts as zero). The oldest warps
++    // may issue global loads while the running total stays within
++    // LLS_K * BASE; younger warps keep issuing other instructions but their
++    // loads are held (CCWS throttles loads only). With no lost locality
++    // every warp fits, so inputs without contention are not throttled.
++    const unsigned long long base = 1024;
++    const unsigned long long cutoff = base * m_lls_k;
++    // LLS_DECAY (default 10): on every call each supervised warp's score
++    // drops by (score >> LLS_DECAY) + 1. A warp that is held back makes no
++    // L1 accesses, so without this its score would stay high and it would
++    // stay held until older warps finish (starvation). CCWS likewise lets
++    // scores decay over time. LLS_DECAY=0 turns this off.
++    static const char *decay_env = getenv("LLS_DECAY");
++    static const unsigned decay = decay_env ? atoi(decay_env) : 10;
++    for (auto *w : m_supervised_warps)
++      if (w) {
++        w->set_daws_block(false);
++        if (decay) w->lost_locality_decay(decay);
++      }
++    ++m_stats->proposal_daws_calls;
++    m_stats->proposal_daws_runnable_sum += pool.size();
++    unsigned long long total = 0;
++    unsigned admit = 0;
++    for (const candidate *c : pool) {
++      unsigned long long s = (c->warp->lost_locality_score() >> 9) << 9;
++      total += base + s;
++      if (admit && total > cutoff) break;
++      ++admit;
++    }
++    if (admit < pool.size()) ++m_stats->proposal_daws_throttled_calls;
++    m_stats->proposal_daws_admitted_sum += admit;
++    // LLS_GATE=1: hold only the loads of warps past the cutoff (CCWS paper).
++    // Default 0: warps past the cutoff do not issue at all, the same gate
++    // as static warp limiting, so the two can be compared directly.
++    static const char *gate_env = getenv("LLS_GATE");
++    static const bool load_gate = gate_env && atoi(gate_env);
++    if (load_gate) {
++      for (unsigned i = admit; i < pool.size(); ++i)
++        pool.at(i)->warp->set_daws_block(true);
++    } else if (pool.size() > admit) pool.resize(admit);
++  } else if (m_lls_mode == 2) {
++    // CCWS-style cutoff: every warp weighs BASE plus its lost-locality score
++    // and warps are admitted in score order until the total passes
++    // LLS_K * BASE. With no lost locality LLS_K warps run; the more locality
++    // the admitted warps are losing, the fewer warps share the L1.
++    const unsigned long long base = 1024;
++    const unsigned long long cutoff = base * m_lls_k;
++    unsigned long long total = 0;
++    unsigned admit = 0;
++    for (const candidate *c : pool) {
++      total += base + c->warp->lost_locality_score();
++      if (admit && total > cutoff) break;
++      ++admit;
++    }
++    if (m_warp_limit && admit > m_warp_limit) admit = m_warp_limit;
++    pool.resize(admit);
++  } else if (pool.size() > m_warp_limit) {
++    pool.resize(m_warp_limit);
++  }
++  if (use_lls && runnable) {
++    ++m_stats->proposal_lls_admit_calls;
++    m_stats->proposal_lls_admitted_sum += pool.size();
++    m_stats->proposal_lls_runnable_sum += runnable;
++  }
++  // Keep the S(w) issue order inside the admitted set.
++  for (const auto &c : m_candidates)
++    if (std::find(pool.begin(), pool.end(), &c) != pool.end())
++      m_next_cycle_prioritized_warps.push_back(c.warp);
++}
++
+ void oldest_scheduler::order_warps() {
+   order_by_priority(m_next_cycle_prioritized_warps, m_supervised_warps,
+                     m_last_supervised_issued, m_supervised_warps.size(),
+@@ -2373,6 +3176,31 @@ void ldst_unit::L1_latency_queue_cycle() {
+       bool write_sent = was_write_sent(events);
+       bool read_sent = was_read_sent(events);
+ 
++      // Lost-locality tracking: per-warp record of load sectors touched.
++      if (mf_next->get_inst().is_load() &&
++          (status == HIT || status == HIT_RESERVED || status == MISS)) {
++        static const char *lls_inc_env = getenv("LLS_INC");
++        static const unsigned lls_inc = lls_inc_env ? atoi(lls_inc_env) : 256;
++        unsigned wid = mf_next->get_inst().warp_id();
++        new_addr_type addr = mf_next->get_addr();
++        unsigned sectors = mf_next->get_access_sector_mask().to_ulong();
++        if (!sectors) sectors = 1u << ((addr >> 5) & 3);
++        ++m_stats->proposal_lls_l1_observations;
++        bool reuse = false;
++        if (m_core->get_warp_nonconst(wid)->observe_l1_access(
++                addr >> 7, sectors, status == MISS, lls_inc, &reuse))
++          ++m_stats->proposal_lls_lost_sectors;
++        m_core->daws_observe(mf_next->get_inst().pc,
++                             mf_next->get_inst().get_uid(),
++                             mf_next->get_inst().active_count(), reuse);
++        static const char *mode_env = getenv("LLS_MODE");
++        static const bool daws2 = mode_env && atoi(mode_env) == 5;
++        static const char *rp_env = getenv("LLS_REUSE_PCT");
++        static const unsigned rp = rp_env ? atoi(rp_env) : 25;
++        if (daws2 && m_core->daws_pc_locality(mf_next->get_inst().pc, rp))
++          m_core->get_warp_nonconst(wid)->daws2_access(addr >> 7);
++      }
++
+       if (status == HIT) {
+         assert(!read_sent);
+         l1_latency_queue[j][0] = NULL;
+diff --git a/src/gpgpu-sim/shader.h b/src/gpgpu-sim/shader.h
+index 8d5b761..bb6ca52 100644
+--- a/src/gpgpu-sim/shader.h
++++ b/src/gpgpu-sim/shader.h
+@@ -133,6 +133,16 @@ class shd_warp_t {
+     m_done_exit = true;
+     m_last_fetch = 0;
+     m_next = 0;
++    m_locality_score = 512;
++    m_locality_valid = false;
++    for (auto &entry : m_pc_locality) entry.valid = false;
++    m_pc_locality_victim = 0;
++    for (auto &entry : m_pc_locality_alt) entry.valid = false;
++    m_pc_locality_alt_victim = 0;
++        m_spatial_lines.clear();
++    lost_locality_reset();
++    m_spatial_epoch = 0;
++    m_last_memory_pc_valid = false;
+     m_streamID = (unsigned long long)-1;
+ 
+     // Jin: cdp support
+@@ -176,6 +186,16 @@ class shd_warp_t {
+   void init(address_type start_pc, unsigned cta_id, unsigned wid,
+             const std::bitset<MAX_WARP_SIZE> &active, unsigned dynamic_warp_id,
+             unsigned long long streamID) {
++    m_locality_score = 512;
++    m_locality_valid = false;
++    for (auto &entry : m_pc_locality) entry.valid = false;
++    m_pc_locality_victim = 0;
++    for (auto &entry : m_pc_locality_alt) entry.valid = false;
++    m_pc_locality_alt_victim = 0;
++        m_spatial_lines.clear();
++    lost_locality_reset();
++    m_spatial_epoch = 0;
++    m_last_memory_pc_valid = false;
+     m_streamID = streamID;
+     m_cta_id = cta_id;
+     m_warp_id = wid;
+@@ -225,7 +245,299 @@ class shd_warp_t {
+     m_gmma_outstanding.clear();
+     m_gmma_commited_groups.clear();
+   }
++  unsigned sample_spatial_locality(const warp_inst_t &inst,
++                                  unsigned line_size,
++                                  unsigned long long *reuse_bytes = NULL) {
++    assert(line_size > 0);
+ 
++    // Unique bytes per instruction: total, spatial, temporal, history miss.
++    if (reuse_bytes) {
++      for (unsigned i = 0; i < 4; ++i) reuse_bytes[i] = 0;
++    }
++
++    const unsigned history_capacity = 64;
++    const unsigned history_window = 8;
++
++    // First collect the whole instruction. Duplicate accesses by lanes
++    // must not count as reuse across different dynamic instructions.
++    std::map<new_addr_type, std::vector<unsigned long long>> current;
++
++    for (unsigned lane = 0; lane < MAX_WARP_SIZE; ++lane) {
++      if (!inst.get_active_mask().test(lane)) continue;
++
++      for (auto addr : inst.locality_addresses(lane)) {
++        for (unsigned b = 0; b < inst.data_size; ++b) {
++          new_addr_type byte_addr = addr + b;
++          new_addr_type line = byte_addr / line_size;
++          unsigned offset = byte_addr % line_size;
++
++          auto &bits = current[line];
++          if (bits.empty())
++            bits.assign((line_size + 63) / 64, 0);
++
++          bits[offset / 64] |= 1ULL << (offset % 64);
++        }
++      }
++    }
++
++    if (current.empty()) return 0;
++    ++m_spatial_epoch;
++
++    // Expire history based on this warp's observed load count.
++    m_spatial_lines.erase(
++        std::remove_if(
++            m_spatial_lines.begin(), m_spatial_lines.end(),
++            [this, history_window](const spatial_line_entry &entry) {
++              return m_spatial_epoch - entry.last_seen > history_window;
++            }),
++        m_spatial_lines.end());
++
++    unsigned long long total_bytes = 0;
++    unsigned long long spatial_bytes = 0;
++    unsigned long long temporal_bytes = 0;
++    unsigned long long history_miss_bytes = 0;
++
++    // Compare against prior instructions only. Update existing entries
++    // before inserting new ones, preserving the original history policy.
++    for (const auto &item : current) {
++      auto found = std::find_if(
++          m_spatial_lines.begin(), m_spatial_lines.end(),
++          [&item](const spatial_line_entry &entry) {
++            return entry.line == item.first;
++          });
++
++      for (unsigned i = 0; i < item.second.size(); ++i) {
++        unsigned long long bits = item.second[i];
++        total_bytes += __builtin_popcountll(bits);
++
++        if (found != m_spatial_lines.end()) {
++          assert(found->used.size() == item.second.size());
++          spatial_bytes +=
++              __builtin_popcountll(bits & ~found->used[i]);
++          temporal_bytes +=
++              __builtin_popcountll(bits & found->used[i]);
++        } else {
++          history_miss_bytes += __builtin_popcountll(bits);
++        }
++      }
++
++      if (found != m_spatial_lines.end()) {
++        for (unsigned i = 0; i < item.second.size(); ++i)
++          found->used[i] |= item.second[i];
++        found->last_seen = m_spatial_epoch;
++      }
++    }
++
++    assert(total_bytes ==
++           spatial_bytes + temporal_bytes + history_miss_bytes);
++    if (reuse_bytes) {
++      reuse_bytes[0] = total_bytes;
++      reuse_bytes[1] = spatial_bytes;
++      reuse_bytes[2] = temporal_bytes;
++      reuse_bytes[3] = history_miss_bytes;
++    }
++
++    // Insert newly observed lines into bounded history.
++    for (const auto &item : current) {
++      auto found = std::find_if(
++          m_spatial_lines.begin(), m_spatial_lines.end(),
++          [&item](const spatial_line_entry &entry) {
++            return entry.line == item.first;
++          });
++
++      if (found != m_spatial_lines.end()) continue;
++
++      spatial_line_entry entry;
++      entry.line = item.first;
++      entry.last_seen = m_spatial_epoch;
++      entry.used = item.second;
++
++      if (m_spatial_lines.size() < history_capacity) {
++        m_spatial_lines.push_back(entry);
++      } else {
++        auto victim = std::min_element(
++            m_spatial_lines.begin(), m_spatial_lines.end(),
++            [](const spatial_line_entry &a,
++               const spatial_line_entry &b) {
++              return a.last_seen < b.last_seen;
++            });
++        *victim = entry;
++      }
++    }
++
++    return total_bytes
++        ? static_cast<unsigned>(1024ULL * (spatial_bytes + temporal_bytes) / total_bytes)
++        : 0;
++  }
++
++  unsigned locality_score() const { return m_locality_score; }
++  bool pc_locality_valid(address_type pc) const {
++    for (const auto &entry : m_pc_locality)
++      if (entry.valid && entry.pc == pc) return true;
++    return false;
++  }
++  unsigned pc_locality_score(address_type pc) const {
++    for (const auto &entry : m_pc_locality)
++      if (entry.valid && entry.pc == pc) return entry.score;
++    return 512;
++  }
++    unsigned predicted_locality(unsigned mode) {
++    // Preserve the original per-warp EMA ablation.
++    if (!mode) return m_locality_score;
++
++    // Apply PC locality only to a valid global-load head.
++    if (ibuffer_empty() || !ibuffer_next_valid()) return 512;
++
++    const warp_inst_t *head = ibuffer_next_inst();
++    if (!head || head->space.get_type() != global_space ||
++        head->op != LOAD_OP || head->isatomic())
++      return 512;
++
++    return pc_locality_score(head->pc);
++  }
++  void observe_pc_locality(address_type pc, unsigned score) {
++    for (auto &entry : m_pc_locality) {
++      if (entry.valid && entry.pc == pc) {
++        entry.score = (entry.score + score) / 2;
++        m_last_memory_pc = pc;
++        m_last_memory_pc_valid = true;
++        return;
++      }
++    }
++    auto &entry = m_pc_locality[m_pc_locality_victim];
++    entry.pc = pc; entry.score = score; entry.valid = true;
++    m_pc_locality_victim = (m_pc_locality_victim + 1) % PC_LOCALITY_ENTRIES;
++    m_last_memory_pc = pc;
++    m_last_memory_pc_valid = true;
++  }
++  // Observe-only shadow predictor: same PC table policy, old formula
++  // (spatial bytes only). Never used for scheduling.
++  unsigned pc_locality_score_alt(address_type pc) const {
++    for (const auto &entry : m_pc_locality_alt)
++      if (entry.valid && entry.pc == pc) return entry.score;
++    return 512;
++  }
++  unsigned predicted_locality_alt(unsigned mode) {
++    if (!mode) return m_locality_score;
++    if (ibuffer_empty() || !ibuffer_next_valid()) return 512;
++    const warp_inst_t *head = ibuffer_next_inst();
++    if (!head || head->space.get_type() != global_space ||
++        head->op != LOAD_OP || head->isatomic())
++      return 512;
++    return pc_locality_score_alt(head->pc);
++  }
++  void observe_pc_locality_alt(address_type pc, unsigned score) {
++    for (auto &entry : m_pc_locality_alt) {
++      if (entry.valid && entry.pc == pc) {
++        entry.score = (entry.score + score) / 2;
++        return;
++      }
++    }
++    auto &entry = m_pc_locality_alt[m_pc_locality_alt_victim];
++    entry.pc = pc; entry.score = score; entry.valid = true;
++    m_pc_locality_alt_victim =
++        (m_pc_locality_alt_victim + 1) % PC_LOCALITY_ENTRIES;
++  }
++  // Lost-locality score (CCWS-style). Each warp remembers the 32B sectors it
++  // recently touched in a small direct-mapped table. An L1 miss on a sector
++  // this warp touched before means the data was evicted between two uses by
++  // the same warp: locality that was lost to cache contention.
++  void lost_locality_reset() {
++    for (auto &e : m_ll_table) { e.line = 0; e.sectors = 0; }
++    m_lls = 0;
++    m_win_lost = 0;
++    m_win_obs = 0;
++    m_daws_block = false;
++    daws2_reset();
++  }
++  // DAWS v2 (LLS_MODE=5): measured per-warp footprint. Distinct L1 lines
++  // that this warp touches in one loop iteration (an issued PC lower than the
++  // previous one ends the iteration), counting only loads whose PC shows
++  // intra-warp reuse. Each line counts once, so an unrolled loop is not
++  // overcounted. A line already touched in the previous iteration is
++  // cross-iteration reuse; the warp's reuse fraction says whether keeping
++  // its lines in the cache pays off at all.
++  void daws2_reset() {
++    m_it_n[0] = m_it_n[1] = 0;
++    m_it_cur = 0;
++    m_x_obs = m_x_cross = 0;
++    m_d2_fp = 0;
++    m_d2_fp_valid = false;
++    m_d2_last_pc = 0;
++    m_d2_pc_valid = false;
++  }
++  void daws2_access(new_addr_type line) {
++    unsigned cur = m_it_cur, prev = cur ^ 1;
++    for (unsigned i = 0; i < m_it_n[cur]; ++i)
++      if (m_it_lines[cur][i] == line) return;  // already counted this iteration
++    if (m_it_n[cur] < D2_LINES) m_it_lines[cur][m_it_n[cur]++] = line;
++    ++m_x_obs;
++    for (unsigned i = 0; i < m_it_n[prev]; ++i)
++      if (m_it_lines[prev][i] == line) { ++m_x_cross; break; }
++    if (m_x_obs > 4096) { m_x_obs /= 2; m_x_cross /= 2; }
++  }
++  void daws2_issue_pc(address_type pc) {
++    if (m_d2_pc_valid && pc < m_d2_last_pc && m_it_n[m_it_cur]) {
++      unsigned n = m_it_n[m_it_cur];
++      m_d2_fp = m_d2_fp_valid ? (m_d2_fp + n + 1) / 2 : n;
++      m_d2_fp_valid = true;
++      m_it_cur ^= 1;
++      m_it_n[m_it_cur] = 0;
++    }
++    m_d2_last_pc = pc;
++    m_d2_pc_valid = true;
++  }
++  // Footprint to reserve for this warp: 0 when it has no measured iteration
++  // yet or too little cross-iteration reuse to be worth protecting.
++  unsigned daws2_footprint(unsigned min_reuse_pct) const {
++    if (!m_d2_fp_valid || m_x_obs < 32) return 0;
++    if (m_x_cross * 100 < m_x_obs * min_reuse_pct) return 0;
++    return m_d2_fp;
++  }
++  // DAWS (LLS_MODE=4): set by the scheduler when this warp's predicted
++  // footprint does not fit; the warp may still issue non-load instructions.
++  void set_daws_block(bool b) { m_daws_block = b; }
++  bool daws_block() const { return m_daws_block; }
++  bool observe_l1_access(new_addr_type line, unsigned sectors, bool miss,
++                         unsigned inc, bool *reuse_out = NULL) {
++    unsigned long long key = line + 1;  // 0 marks an empty entry
++    unsigned idx = (unsigned)((line ^ (line >> 8) ^ (line >> 16)) &
++                              (LL_ENTRIES - 1));
++    ll_entry &e = m_ll_table[idx];
++    bool lost = false;
++    if (e.line == key) {
++      lost = miss && (e.sectors & sectors);
++      if (reuse_out) *reuse_out = (e.sectors & sectors) != 0;
++      e.sectors |= sectors;
++    } else {
++      e.line = key;
++      e.sectors = sectors;
++    }
++    m_lls -= m_lls >> LL_DECAY_SHIFT;
++    if (lost) m_lls = m_lls + inc > LL_MAX ? LL_MAX : m_lls + inc;
++    ++m_win_obs;
++    if (lost) ++m_win_lost;
++    return lost;
++  }
++  // Time-based decay for LLS_MODE=6 (see the scheduler).
++  void lost_locality_decay(unsigned shift) {
++    if (m_lls) m_lls -= (m_lls >> shift) + 1;
++  }
++  unsigned lost_locality_score() const { return m_lls; }
++  // Hand this warp's lost/observed counts since the last call to its
++  // scheduler (LLS_MODE=3 controller) and start a new window.
++  void take_lost_window(unsigned long long &lost, unsigned long long &obs) {
++    lost += m_win_lost;
++    obs += m_win_obs;
++    m_win_lost = 0;
++    m_win_obs = 0;
++  }
++  bool locality_history_valid() const { return m_locality_valid; }
++  void observe_locality(unsigned score) {
++    assert(score <= 1024);
++    m_locality_score = m_locality_valid ? (m_locality_score + score) / 2 : score;
++    m_locality_valid = true;
++  }
+   bool functional_done() const;
+   bool waiting();  // not const due to membar
+   bool hardware_done() const;
+@@ -258,6 +570,7 @@ class shd_warp_t {
+   void set_membar() { m_membar = true; }
+   void clear_membar() { m_membar = false; }
+   bool get_membar() const { return m_membar; }
++  bool proposal_async_wait_flag() const { return m_waiting_ldgsts || m_waiting_tma_bulk_group || m_waiting_gmma_group; }
+   void set_mbarrier_waiting(unsigned lane) {
+     m_mbarrier_waiting_entries[lane].m_waiting = true;
+   }
+@@ -419,6 +732,44 @@ class shd_warp_t {
+   unsigned long long m_streamID;
+   unsigned m_cta_id;
+   unsigned m_warp_id;
++  static constexpr unsigned PC_LOCALITY_ENTRIES = 16;
++    // Per-warp recent spatial-access history.
++  // Each bit represents one previously accessed byte within a line.
++  struct spatial_line_entry {
++    new_addr_type line;
++    unsigned long long last_seen;
++    std::vector<unsigned long long> used;
++  };
++
++  std::vector<spatial_line_entry> m_spatial_lines;
++  unsigned long long m_spatial_epoch = 0;
++  struct pc_locality_entry { address_type pc; unsigned score; bool valid; };
++  pc_locality_entry m_pc_locality[PC_LOCALITY_ENTRIES];
++  unsigned m_pc_locality_victim;
++  pc_locality_entry m_pc_locality_alt[PC_LOCALITY_ENTRIES];
++  unsigned m_pc_locality_alt_victim;
++  address_type m_last_memory_pc;
++  bool m_last_memory_pc_valid;
++  static constexpr unsigned LL_ENTRIES = 256;  // power of two
++  static constexpr unsigned LL_DECAY_SHIFT = 4;
++  static constexpr unsigned LL_MAX = 1u << 16;
++  struct ll_entry { unsigned long long line; unsigned sectors; };
++  ll_entry m_ll_table[LL_ENTRIES];
++  unsigned m_lls;
++  unsigned m_win_lost;
++  unsigned m_win_obs;
++  bool m_daws_block;
++  static constexpr unsigned D2_LINES = 128;
++  new_addr_type m_it_lines[2][D2_LINES];
++  unsigned m_it_n[2];
++  unsigned m_it_cur;
++  unsigned m_x_obs, m_x_cross;
++  unsigned m_d2_fp;
++  bool m_d2_fp_valid;
++  address_type m_d2_last_pc;
++  bool m_d2_pc_valid;
++  unsigned m_locality_score;
++  bool m_locality_valid;
+   unsigned m_warp_size;
+   unsigned m_dynamic_warp_id;
+ 
+@@ -738,6 +1089,7 @@ enum scheduler_prioritization_type {
+ enum concrete_scheduler {
+   CONCRETE_SCHEDULER_LRR = 0,
+   CONCRETE_SCHEDULER_GTO,
++  CONCRETE_SCHEDULER_DAV,
+   CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE,
+   CONCRETE_SCHEDULER_RRR,
+   CONCRETE_SCHEDULER_WARP_LIMITING,
+@@ -918,6 +1270,46 @@ class gto_scheduler : public scheduler_unit {
+   }
+ };
+ 
++// Divergence-aware issue scheduling; fetch retains its baseline policy.
++class dav_scheduler : public gto_scheduler {
++ public:
++  using gto_scheduler::gto_scheduler;
++  virtual void order_warps();
++  virtual void done_adding_supervised_warps();
++
++ private:
++  struct candidate {
++    shd_warp_t *warp;
++    unsigned long long score;
++    bool runnable;
++    bool greedy;
++    unsigned age;
++    unsigned position;
++  };
++  std::vector<candidate> m_candidates;
++  unsigned m_locality_weight;
++  unsigned m_prediction_mode;
++  bool m_stall_aware;
++  // LAV-limit: max runnable warps kept per scheduler; 0 = unlimited.
++  unsigned m_warp_limit;
++  // LLS: 0 = off, 1 = pick the LAV_WARP_LIMIT warps by lost-locality score,
++  // 2 = CCWS-style adaptive limit, 3 = windowed feedback on the lost
++  // fraction (see order_warps).
++  unsigned m_lls_mode;
++  unsigned m_lls_k;
++  // LLS_MODE=3 controller state.
++  unsigned m_ctl_n;
++  unsigned m_ctl_calls;
++  unsigned m_ctl_window;
++  unsigned m_ctl_hi;  // lost fraction thresholds, in units of 1/10000
++  unsigned m_ctl_lo;
++  // LLS_MODE=4 (DAWS-style footprint admission).
++  unsigned long long m_daws_budget;  // L1 lines per scheduler
++  unsigned m_daws_reuse_pct;
++  unsigned m_daws_warp_reuse_pct;  // LLS_WARP_REUSE, mode 5
++  unsigned m_weighted_divergence[MAX_WARP_SIZE + 1];
++};
++
+ class oldest_scheduler : public scheduler_unit {
+  public:
+   oldest_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+@@ -2250,6 +2642,9 @@ class shader_core_config : public core_config {
+       max_cta_per_core;  // Limit on number of concurrent CTAs in shader core
+   unsigned max_barriers_per_cta;
+   char *gpgpu_scheduler_string;
++  unsigned gpgpu_ld_alpha;
++  unsigned gpgpu_locality_predictor;
++  bool gpgpu_priority_fetch;
+   unsigned gpgpu_shmem_per_block;
+   unsigned gpgpu_registers_per_block;
+   char *pipeline_widths_string;
+@@ -2422,6 +2817,73 @@ struct shader_core_stats_pod {
+   unsigned gpu_stall_shd_mem_breakdown[N_MEM_STAGE_ACCESS_TYPE]
+                                       [N_MEM_STAGE_STALL_TYPE];
+   unsigned gpu_reg_bank_conflict_stalls;
++  // Cumulative across kernels; each warp belongs to one scheduler.
++  unsigned long long proposal_locality_prediction_count;
++  unsigned long long proposal_locality_prediction_abs_error;
++  unsigned long long proposal_locality_constant_abs_error;
++  unsigned long long proposal_pc_prediction_count;
++  unsigned long long proposal_pc_warm_prediction_count;
++  unsigned long long proposal_pc_prediction_abs_error;
++  unsigned long long proposal_ema_all_prediction_abs_error;
++  unsigned long long proposal_neutral_all_prediction_abs_error;
++  unsigned long long proposal_locality_samples;
++  unsigned long long proposal_reuse_total_bytes;
++  unsigned long long proposal_reuse_spatial_bytes;
++  unsigned long long proposal_reuse_temporal_bytes;
++  unsigned long long proposal_reuse_history_miss_bytes;
++  unsigned long long proposal_locality_references;
++  unsigned long long proposal_locality_unique_lines;
++  unsigned long long proposal_locality_score_sum;
++  unsigned long long proposal_locality_tracking_ns;
++  unsigned long long proposal_buffer_slots;
++  unsigned long long proposal_empty_buffer_warp_cycles;
++  unsigned long long proposal_icache_pending_warp_cycles;
++  unsigned long long proposal_barrier_flag_warp_cycles;
++  unsigned long long proposal_atomic_wait_warp_cycles;
++  unsigned long long proposal_async_wait_flag_warp_cycles;
++  unsigned long long proposal_scoreboard_warp_cycles;
++  unsigned long long proposal_wrong_path_warp_cycles;
++  unsigned long long proposal_null_head_warp_cycles;
++  unsigned long long proposal_top_warp_cycles;
++  unsigned long long proposal_top_empty_cycles;
++  unsigned long long proposal_top_empty_icache_pending_cycles;
++  unsigned long long proposal_top_empty_no_wait_flags_cycles;
++  unsigned long long proposal_top_empty_other_issued_cycles;
++  unsigned long long proposal_top_empty_no_issue_cycles;
++  unsigned long long proposal_pipeline_or_dispatch_stall_cycles;
++  unsigned long long proposal_order_calls;
++  unsigned long long proposal_order_ns;
++  // Observe-only comparison of new vs old locality formula.
++  unsigned long long proposal_altcmp_samples_changed;
++  unsigned long long proposal_altcmp_calls;
++  unsigned long long proposal_altcmp_multi_runnable;
++  unsigned long long proposal_altcmp_score_diff_warps;
++  unsigned long long proposal_altcmp_top_differs;
++  unsigned long long proposal_altcmp_multi_ready;
++  unsigned long long proposal_altcmp_top_ready_differs;
++  unsigned long long proposal_altcmp_order_differs;
++  // Lost-locality (CCWS-style) scoring.
++  unsigned long long proposal_lls_l1_observations;
++  unsigned long long proposal_lls_lost_sectors;
++  unsigned long long proposal_lls_admit_calls;
++  unsigned long long proposal_lls_admitted_sum;
++  unsigned long long proposal_lls_runnable_sum;
++  unsigned long long proposal_lls_ctl_windows;
++  unsigned long long proposal_lls_ctl_n_sum;
++  unsigned long long proposal_lls_ctl_down;
++  unsigned long long proposal_lls_ctl_up;
++  unsigned long long proposal_daws_calls;
++  unsigned long long proposal_daws_throttled_calls;
++  unsigned long long proposal_daws_warp_footprint_sum;
++  unsigned long long proposal_daws_admitted_sum;
++  unsigned long long proposal_daws_runnable_sum;
++  unsigned long long proposal_daws_counted_sum;
++  unsigned long long proposal_warp_samples;
++  unsigned long long proposal_active_lanes;
++  unsigned long long proposal_lane_slots;
++  unsigned long long proposal_divergent_warp_cycles;
++  unsigned long long proposal_memory_dependency_warp_cycles;
++  unsigned long long proposal_memory_dependency_scheduler_cycles;
+   unsigned long long *shader_cycle_distro;
+   unsigned *last_shader_cycle_distro;
+   unsigned *num_warps_issuable;
+@@ -2777,6 +3239,66 @@ class shader_core_ctx : public core_t {
+   const shd_warp_t *get_warp(unsigned warp_id) const { return m_warp[warp_id]; }
+   shd_warp_t *get_warp_nonconst(unsigned warp_id) { return m_warp[warp_id]; }
+ 
++  // DAWS-style load characterization (LLS_MODE=4), shared by the SM's
++  // schedulers. For each load PC: how many L1 accesses one active lane
++  // causes (about 1 for a divergent load, about 1/32 for a coalesced one) and
++  // how often a warp touches a sector it already touched (intra-warp reuse).
++  struct daws_pc_entry {
++    address_type pc;
++    unsigned long long last_uid;
++    unsigned long long insts, lanes, accesses, reuse;
++    bool valid;
++  };
++  static constexpr unsigned DAWS_PC_ENTRIES = 32;  // spmv has 17 load PCs
++  daws_pc_entry m_daws_pc[DAWS_PC_ENTRIES] = {};
++  unsigned m_daws_victim = 0;
++  void daws_observe(address_type pc, unsigned long long uid, unsigned active,
++                    bool reuse) {
++    daws_pc_entry *e = NULL;
++    for (auto &x : m_daws_pc)
++      if (x.valid && x.pc == pc) { e = &x; break; }
++    if (!e) {
++      e = &m_daws_pc[m_daws_victim];
++      m_daws_victim = (m_daws_victim + 1) % DAWS_PC_ENTRIES;
++      *e = daws_pc_entry();
++      e->pc = pc;
++      e->last_uid = (unsigned long long)-1;
++      e->valid = true;
++    }
++    if (e->last_uid != uid) {
++      e->last_uid = uid;
++      ++e->insts;
++      e->lanes += active;
++    }
++    ++e->accesses;
++    if (reuse) ++e->reuse;
++    if (e->accesses > (1u << 20)) {  // keep adapting: halve old history
++      e->insts = (e->insts + 1) / 2; e->lanes = (e->lanes + 1) / 2;
++      e->accesses /= 2; e->reuse /= 2;
++    }
++  }
++  // DAWS load classification: a load is diverged when one active lane makes
++  // at least half an L1 access on average, converged otherwise. Returns
++  // false when no load shows intra-warp reuse (no locality to protect).
++  // Mode 5: does this load PC show intra-warp reuse?
++  bool daws_pc_locality(address_type pc, unsigned reuse_pct) const {
++    for (const auto &x : m_daws_pc)
++      if (x.valid && x.pc == pc)
++        return x.insts >= 8 && x.reuse * 100 >= x.accesses * reuse_pct;
++    return false;
++  }
++  bool daws_classify(unsigned reuse_pct, unsigned &n_div,
++                     unsigned &n_conv) const {
++    bool locality = false;
++    n_div = n_conv = 0;
++    for (const auto &x : m_daws_pc) {
++      if (!x.valid || x.insts < 8 || !x.lanes) continue;
++      if (x.accesses * 2 >= x.lanes) ++n_div; else ++n_conv;
++      if (x.reuse * 100 >= x.accesses * reuse_pct) locality = true;
++    }
++    return locality;
++  }
++
+   // used by pipeline timing model components:
+   // modifiers
+   void mem_instruction_stats(const warp_inst_t &inst);
+@@ -3175,6 +3697,12 @@ class shader_core_ctx : public core_t {
+   unsigned long long m_last_inst_gpu_sim_cycle;
+   unsigned long long m_last_inst_gpu_tot_sim_cycle;
+ 
++  // Scratch capacity is retained across memory instructions. No score state.
++  unsigned m_priority_last_issued;
++  bool m_locality_enabled;
++  std::vector<new_addr_type> m_locality_lines;
++  std::vector<new_addr_type> m_locality_lane_lines;
++
+   // general information
+   unsigned m_sid;  // shader id
+   unsigned m_tpc;  // texture processor cluster id (aka, node id when using
+diff --git a/src/intersim2/Makefile b/src/intersim2/Makefile
+index a7485e2..9fe25ab 100644
+--- a/src/intersim2/Makefile
++++ b/src/intersim2/Makefile
+@@ -42,7 +42,7 @@ ifeq ($(CREATE_LIBRARY),1)
+ INCPATH += -I$(GPGPUSIM_ROOT)/src/gpgpu-sim/
+ endif
+ 
+-CPPFLAGS += -Wall $(INCPATH) $(DEFINE)
++CPPFLAGS += -Wall $(INCPATH) $(DEFINE) -std=c++17
+ ifneq ($(DEBUG),1)
+ CPPFLAGS += -O3
+ endif
