@@ -1,0 +1,2 @@
+https://github.com/gpgpu-sim/gpgpu-sim_distribution.git
+c4cc73d3a1802f64b1283d3ae06ed1dcdb6e3bab
